@@ -1,0 +1,91 @@
+#!/bin/bash
+echo "Start System Admin Userdata ..."
+/bin/timedatectl set-timezone America/Los_Angeles
+/bin/domainname "{{.Env.local_domain_name}}"
+/bin/hostname "{{.Env.host_name}}"
+echo PS1=\"[\\\\u@{{.Env.host_name}}]\" >> /etc/bashrc
+
+#
+apt-get update
+
+apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common
+curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
+add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/debian buster stable"
+
+
+#  install docker and docker-composer
+apt-get update
+apt-get install -y docker-ce docker-compose
+
+#  change default docker network subnet from 172 to 192.
+#  you don't need to do this if your local network is not 172 network
+cat <<EOF > /etc/docker/daemon.json
+{
+ "default-address-pools":
+  [
+   {"base":"192.168.0.0/16","size":24}
+  ]
+}
+EOF
+
+#  install git required since we need to pull down the cloudinit scripts
+apt-get install -y git unzip jq rsync
+
+# python and nodejs are popular tool so installing it
+#apt-get install -y python3-pip python-pip
+#apt-get install -y nodejs npm
+
+# install gomplate
+curl -s -o /usr/local/bin/gomplate -sSL https://github.com/hairyhenderson/gomplate/releases/download/v3.6.0/gomplate_linux-amd64
+chmod 755 /usr/local/bin/gomplate
+
+# install vault
+curl -s -o /usr/local/bin/vault.zip https://releases.hashicorp.com/vault/1.3.4/vault_1.3.4_linux_amd64.zip
+cd /usr/local/bin
+unzip vault.zip
+
+# install letsencrypt
+#apt-get -y install certbot
+
+
+#  Pull down the cloud init code to /tmp folder
+cd /tmp
+git clone {{.Env.GIT_PROJECT}}
+
+#  Passing EBS, EIP information to Instance
+/bin/echo "{{.Env.USERNAME}}" | tee /tmp/USERS.list
+/bin/echo -e "{{.Env.TASKS}}" > /tmp/build.txt
+
+#  Executing the cloud init script (runcmd)
+cd /tmp/{{.Env.PROJECT_NAME}}
+/tmp/{{.Env.PROJECT_NAME}}/runcmd | tee /tmp/runcmd.log
+
+mkdir -p {{.Env.APPDIR}}/web {{.Env.APPDIR}}/alog
+touch {{.Env.APPDIR}}/web/index.html
+chown -R {{.Env.USERNAMEONLY}}:{{.Env.USERNAMEONLY}} {{.Env.APPDIR}}
+
+#  Enable appadmin to run docker
+usermod -a -G docker {{.Env.USERNAMEONLY}}
+export LOCALIP=`curl curl http://169.254.169.254/latest/meta-data/local-ipv4`
+echo "$LOCALIP {{.Env.host_name}} {{.Env.host_name}}.{{.Env.local_domain_name}}" >> /etc/hosts
+
+#  get the application code
+aws s3 cp {{.Env.S3APPCODE}} /home/{{.Env.USERNAMEONLY}}
+cd /home/{{.Env.USERNAMEONLY}}
+openssl aes-256-cfb1 -pbkdf2 -d -a -k {{.Env.S3KEY}} -in {{.Env.APPTARFILE}}.enc -out {{.Env.APPTARFILE}}
+tar -xzvf {{.Env.APPTARFILE}}
+
+# setup ssh key
+mkdir /home/{{.Env.USERNAMEONLY}}/.ssh
+chmod 700 /home/{{.Env.USERNAMEONLY}}/.ssh
+chown {{.Env.USERNAMEONLY}}:{{.Env.USERNAMEONLY}} /home/{{.Env.USERNAMEONLY}}/.ssh
+aws s3 cp {{.Env.S3APPSSH}} /home/{{.Env.USERNAMEONLY}}/.ssh/authorized_keys
+chown {{.Env.USERNAMEONLY}}:{{.Env.USERNAMEONLY}} /home/{{.Env.USERNAMEONLY}}/.ssh/authorized_keys
+
+#  set up correct ownership
+chown -R {{.Env.USERNAMEONLY}}:{{.Env.USERNAMEONLY}} $HOME/{{.Env.USERNAMEONLY}}/*
+
+#  build and start the container
+su -c "cd /home/{{.Env.USERNAMEONLY}}/build.web; ./build.sh" - {{.Env.USERNAMEONLY}}
+su -c "cd /home/{{.Env.USERNAMEONLY}}/build.js;  ./build.sh" - {{.Env.USERNAMEONLY}}
+su -c "cd /home/{{.Env.USERNAMEONLY}}/run.app;   ./startup.sh" - {{.Env.USERNAMEONLY}}
